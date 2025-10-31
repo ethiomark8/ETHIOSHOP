@@ -1,0 +1,196 @@
+# Build signed release APK, create a GitHub Release (from tag or manual), and attach APK asset(s).
+#
+# Required repository secrets:
+# - KEYSTORE_BASE64   -> Base64-encoded contents of your release keystore (.jks)
+# - KEYSTORE_PASSWORD -> Keystore store password
+# - KEY_ALIAS         -> Key alias inside the keystore
+# - KEY_PASSWORD      -> Key password for the alias
+#
+# Triggers:
+# - push a tag (refs/tags/*) will create a release for that tag
+# - manual run (workflow_dispatch) supports inputs:
+#     tag: tag name to use (if omitted, workflow will fail unless triggered by a tag push)
+#     name: optional release name
+#     body: optional release body/notes
+#
+name: Release and Attach Signed APK
+
+on:
+  push:
+    tags:
+      - 'v*'            # trigger on tags that start with "v", adjust as needed
+      - '*'             # or allow all tags
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to create release for (optional when manually triggering)'
+        required: false
+        default: ''
+      name:
+        description: 'Release name (optional)'
+        required: false
+        default: ''
+      body:
+        description: 'Release body/notes (optional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build, sign release, create GitHub Release, attach APK(s)
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Decode release keystore (required)
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "Decoding release keystore from KEYSTORE_BASE64..."
+          echo "$KEYSTORE_BASE64" | base64 --decode > release-keystore.jks
+          ls -la release-keystore.jks
+        shell: bash
+
+      - name: Create keystore.properties for Gradle signing (required)
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "storeFile=release-keystore.jks" > keystore.properties
+          echo "storePassword=${KEYSTORE_PASSWORD}" >> keystore.properties
+          echo "keyAlias=${KEY_ALIAS}" >> keystore.properties
+          echo "keyPassword=${KEY_PASSWORD}" >> keystore.properties
+          echo "Created keystore.properties (not printing secret values)."
+        shell: bash
+
+      - name: Assemble Release APK (Gradle signing must be configured to read keystore.properties)
+        if: env.KEYSTORE_BASE64 != ''
+        run: ./gradlew -Porg.gradle.jvmargs="-Xmx2g" clean assembleRelease --no-daemon
+        env:
+          JAVA_TOOL_OPTIONS: "-Xmx2g"
+
+      - name: Check for built APKs
+        run: |
+          echo "Listing potential APK outputs..."
+          ls -la app/build/outputs/apk/release || true
+          echo "Searching for APK files..."
+          find app/build/outputs/apk -type f -name '*.apk' -print || true
+        shell: bash
+
+      - name: Fail if no signed release APK found
+        if: env.KEYSTORE_BASE64 != '' && steps.check_for_apks_conclusion_result != 'success'
+        run: |
+          echo "No signed APK found in app/build/outputs/apk/release. Check build logs and signing config."
+          exit 1
+        # Note: steps.check_for_apks_conclusion_result is a placeholder - we will rely on the artifact copy step below.
+
+      - name: Prepare dist directory and copy APKs
+        run: |
+          mkdir -p dist
+          # Copy release APKs if present
+          if ls app/build/outputs/apk/release/*.apk 1> /dev/null 2>&1; then
+            cp app/build/outputs/apk/release/*.apk dist/ || true
+          fi
+          # Fallback: copy any APK found under apk outputs
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            find app/build/outputs/apk -type f -name '*.apk' -exec cp {} dist/ \; || true
+          fi
+          echo "Files copied to dist/:"
+          ls -la dist || true
+        shell: bash
+
+      - name: Create zip of APKs
+        run: |
+          cd dist
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          zipname="ethioshop-apks-$timestamp.zip"
+          if [ -n "$(ls -A .)" ]; then
+            zip -j "$zipname" *.apk || true
+            echo "Created $zipname"
+          else
+            echo "No APKs found to zip."
+            exit 1
+          fi
+          ls -la
+        working-directory: dist
+        shell: bash
+
+      - name: Determine release tag and name
+        id: release_info
+        run: |
+          # Determine tag name: prefer push tag, otherwise workflow_dispatch input
+          if [ -n "${GITHUB_REF##*/}" ] && [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${{ github.event.inputs.tag || '' }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "No tag provided (trigger this workflow by pushing a tag or provide 'tag' input when manually running)."
+            exit 1
+          fi
+          # Determine release name and body from inputs
+          NAME="${{ github.event.inputs.name || '' }}"
+          BODY="${{ github.event.inputs.body || '' }}"
+          # Fallback release name
+          if [ -z "$NAME" ]; then
+            NAME="Release $TAG"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "body=$BODY" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Create or update GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          release_name: ${{ steps.release_info.outputs.name }}
+          body: ${{ steps.release_info.outputs.body }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload APK assets to GitHub Release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/*.apk
+          asset_name: ${{ github.repository }}-${{ steps.release_info.outputs.tag }}.apk
+          asset_content_type: application/vnd.android.package-archive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload ZIP asset to GitHub Release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/*.zip
+          asset_name: ${{ github.repository }}-${{ steps.release_info.outputs.tag }}-apks.zip
+          asset_content_type: application/zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup keystore & properties (attempt to shred)
+        if: env.KEYSTORE_BASE64 != ''
+        if: always()
+        run: |
+          shred -u release-keystore.jks || rm -f release-keystore.jks || true
+          shred -u keystore.properties || rm -f keystore.properties || true
+        shell: bash
