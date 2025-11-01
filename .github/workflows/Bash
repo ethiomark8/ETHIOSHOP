@@ -1,0 +1,16 @@
+# in workflow run step (bash)
+# if gradlew exists use it, otherwise generate wrapper and make it executable
+if [ -f "./gradlew" ]; then
+  chmod +x ./gradlew
+else
+  echo "Gradle wrapper missing — generating wrapper using system gradle (requires gradle installed) or installing wrapper via sdkman/apt"
+  # Attempt to generate wrapper (this requires gradle available on runner)
+  gradle wrapper || true
+  if [ -f "./gradlew" ]; then
+    chmod +x ./gradlew
+  else
+    echo "Failed to generate gradle wrapper. Please commit gradlew to the repo or ensure the runner has gradle."
+    exit 1
+  fi
+fi
+./gradlew clean assembleRelease --no-daemon
